@@ -606,13 +606,17 @@ class Equilibrium(IOAble):
         self._omni_lmn = copy_coeffs(
             self.omni_lmn, old_modes_omni, self.omni_basis.modes
         )
+        
+        try:
+            old_well = self.well_l.reshape((-1, self.M_well))
+            new_well = np.zeros((self.L_well + 1, self.M_well))
+            for j in range(self.M_well):
+                new_well[:, j] = copy_coeffs(
+                    old_well[:, j], old_modes_well, self.well_basis.modes
+                )
+        except ValueError:
+            new_well = np.zeros((self.L_well + 1, self.M_well))
 
-        old_well = self.well_l.reshape((-1, self.M_well))
-        new_well = np.zeros((self.L_well + 1, self.M_well))
-        for j in range(self.M_well):
-            new_well[:, j] = copy_coeffs(
-                old_well[:, j], old_modes_well, self.well_basis.modes
-            )
         self._well_l = new_well.flatten()
 
     def get_surface_at(self, rho=None, theta=None, zeta=None):
