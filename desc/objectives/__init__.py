@@ -5,9 +5,9 @@ from ._coils import (
     CoilCurrentLength,
     CoilCurvature,
     CoilLength,
-    CoilsetMinDistance,
+    CoilSetMinDistance,
     CoilTorsion,
-    PlasmaCoilsetMinDistance,
+    PlasmaCoilSetMinDistance,
     QuadraticFlux,
     ToroidalFlux,
 )
@@ -39,12 +39,7 @@ from ._omnigenity import (
     QuasisymmetryTwoTerm,
 )
 from ._profiles import Pressure, RotationalTransform, Shear, ToroidalCurrent
-from ._stability import (
-    BallooningStability,
-    MagneticWell,
-    MercierStability,
-    NewcombMetric,
-)
+from ._stability import BallooningStability, MagneticWell, MercierStability
 from .getters import (
     get_equilibrium_objective,
     get_fixed_axis_constraints,
@@ -75,6 +70,9 @@ from .linear_objectives import (
     FixModeLambda,
     FixModeR,
     FixModeZ,
+    FixNearAxisLambda,
+    FixNearAxisR,
+    FixNearAxisZ,
     FixOmniBmax,
     FixOmniMap,
     FixOmniWell,
@@ -82,6 +80,7 @@ from .linear_objectives import (
     FixPressure,
     FixPsi,
     FixSheetCurrent,
+    FixSumCoilCurrent,
     FixSumModesLambda,
     FixSumModesR,
     FixSumModesZ,

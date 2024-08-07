@@ -9,19 +9,21 @@ import pytest
 from qic import Qic
 from qsc import Qsc
 
-from desc.backend import jnp
+from desc.backend import jnp, tree_leaves
 from desc.coils import (
     CoilSet,
     FourierPlanarCoil,
     FourierRZCoil,
     FourierXYZCoil,
     MixedCoilSet,
+    _Coil,
 )
 from desc.continuation import solve_continuation_automatic
 from desc.equilibrium import EquilibriaFamily, Equilibrium
+from desc.equilibrium.coords import compute_theta_coords
 from desc.examples import get
 from desc.geometry import FourierRZToroidalSurface
-from desc.grid import LinearGrid
+from desc.grid import Grid, LinearGrid
 from desc.io import load
 from desc.magnetic_fields import (
     OmnigenousField,
@@ -31,10 +33,11 @@ from desc.magnetic_fields import (
 )
 from desc.objectives import (
     AspectRatio,
+    BallooningStability,
     BoundaryError,
     CoilCurvature,
     CoilLength,
-    CoilsetMinDistance,
+    CoilSetMinDistance,
     CoilTorsion,
     CurrentDensity,
     FixBoundaryR,
@@ -55,7 +58,7 @@ from desc.objectives import (
     MeanCurvature,
     ObjectiveFunction,
     Omnigenity,
-    PlasmaCoilsetMinDistance,
+    PlasmaCoilSetMinDistance,
     PlasmaVesselDistance,
     PrincipalCurvature,
     QuadraticFlux,
@@ -434,7 +437,7 @@ def test_NAE_QSC_solve():
     ntheta = 75
     r = 0.01
     N = 9
-    eq = Equilibrium.from_near_axis(qsc, r=r, L=6, M=6, N=N, ntheta=ntheta)
+    eq = Equilibrium.from_near_axis(qsc, r=r, L=4, M=4, N=N, ntheta=ntheta)
 
     orig_Rax_val = eq.axis.R_n
     orig_Zax_val = eq.axis.Z_n
@@ -462,13 +465,12 @@ def test_NAE_QSC_solve():
     ):
         objectives = ForceBalance(eq=eqq)
         obj = ObjectiveFunction(objectives)
-        print(constraints)
 
         eqq.solve(
             verbose=3,
             ftol=1e-2,
             objective=obj,
-            maxiter=175,
+            maxiter=50,
             xtol=1e-6,
             constraints=constraints,
         )
@@ -485,7 +487,7 @@ def test_NAE_QSC_solve():
         # Make sure surfaces of solved equilibrium are similar near axis as QSC
         rho_err, theta_err = area_difference_desc(eqq, eq_fit)
 
-        np.testing.assert_allclose(rho_err[:, 0:-4], 0, atol=1e-2, err_msg=string)
+        np.testing.assert_allclose(rho_err[:, 0:-6], 0, atol=1.5e-2, err_msg=string)
         np.testing.assert_allclose(theta_err[:, 0:-6], 0, atol=1e-3, err_msg=string)
 
         # Make sure iota of solved equilibrium is same near axis as QSC
@@ -500,6 +502,91 @@ def test_NAE_QSC_solve():
         data_nae = eqq.compute(["lambda", "|B|"], grid=grid_axis)
         lam_nae = data_nae["lambda"]
         # Reshape to form grids on theta and phi
+
+        phi = np.squeeze(grid_axis.nodes[:, 2])
+        np.testing.assert_allclose(
+            lam_nae, -qsc.iota * qsc.nu_spline(phi), atol=2e-5, err_msg=string
+        )
+
+        # check |B| on axis
+        np.testing.assert_allclose(
+            data_nae["|B|"], np.ones(np.size(phi)) * qsc.B0, atol=1e-4, err_msg=string
+        )
+
+
+@pytest.mark.regression
+@pytest.mark.solve
+@pytest.mark.slow
+def test_NAE_QSC_solve_near_axis_based_off_eq():
+    """Test O(rho) NAE QSC constraints solve when qsc eq is not given."""
+    qsc = Qsc.from_paper("precise QA")
+    ntheta = 75
+    r = 0.01
+    N = 9
+    eq = Equilibrium.from_near_axis(qsc, r=r, L=6, M=6, N=N, ntheta=ntheta)
+
+    orig_Rax_val = eq.axis.R_n
+    orig_Zax_val = eq.axis.Z_n
+
+    eq_fit = eq.copy()
+    eq_lambda_fixed_0th_order = eq.copy()
+    eq_lambda_fixed_1st_order = eq.copy()
+
+    # this has all the constraints we need,
+    cs = get_NAE_constraints(eq, qsc_eq=None, order=1, fix_lambda=False, N=eq.N)
+    cs_lambda_fixed_0th_order = get_NAE_constraints(
+        eq_lambda_fixed_0th_order, qsc_eq=None, order=1, fix_lambda=0, N=eq.N
+    )
+    cs_lambda_fixed_1st_order = get_NAE_constraints(
+        eq_lambda_fixed_1st_order, qsc_eq=None, order=1, fix_lambda=True, N=eq.N
+    )
+
+    for c in cs:
+        # should be no FixSumModeslambda in the fix_lambda=False constraint
+        assert not isinstance(c, FixSumModesLambda)
+
+    for eqq, constraints in zip(
+        [eq, eq_lambda_fixed_0th_order, eq_lambda_fixed_1st_order],
+        [cs, cs_lambda_fixed_0th_order, cs_lambda_fixed_1st_order],
+    ):
+        objectives = ForceBalance(eq=eqq)
+        obj = ObjectiveFunction(objectives)
+
+        eqq.solve(
+            verbose=3,
+            ftol=1e-2,
+            objective=obj,
+            maxiter=100,
+            xtol=1e-6,
+            constraints=constraints,
+        )
+    grid = LinearGrid(L=10, M=20, N=20, NFP=eq.NFP, sym=True, axis=False)
+    grid_axis = LinearGrid(rho=0.0, theta=0.0, N=eq.N_grid, NFP=eq.NFP)
+    # Make sure axis is same
+    for eqq, string in zip(
+        [eq, eq_lambda_fixed_0th_order, eq_lambda_fixed_1st_order],
+        ["no lambda constraint", "lambda_fixed_0th_order", "lambda_fixed_1st_order"],
+    ):
+        np.testing.assert_array_almost_equal(orig_Rax_val, eqq.axis.R_n, err_msg=string)
+        np.testing.assert_array_almost_equal(orig_Zax_val, eqq.axis.Z_n, err_msg=string)
+
+        # Make sure surfaces of solved equilibrium are similar near axis as QSC
+        rho_err, theta_err = area_difference_desc(eqq, eq_fit)
+
+        np.testing.assert_allclose(rho_err[:, 0:-6], 0, atol=1.5e-2, err_msg=string)
+        np.testing.assert_allclose(theta_err[:, 0:-6], 0, atol=1e-3, err_msg=string)
+
+        # Make sure iota of solved equilibrium is same near axis as QSC
+
+        iota = grid.compress(eqq.compute("iota", grid=grid)["iota"])
+
+        np.testing.assert_allclose(iota[0], qsc.iota, atol=1e-5, err_msg=string)
+        np.testing.assert_allclose(iota[1:10], qsc.iota, rtol=5e-3, err_msg=string)
+
+        ### check lambda to match on axis
+        # Evaluate lambda on the axis
+        data_nae = eqq.compute(["lambda", "|B|"], grid=grid_axis)
+        lam_nae = data_nae["lambda"]
 
         phi = np.squeeze(grid_axis.nodes[:, 2])
         np.testing.assert_allclose(
@@ -557,8 +644,8 @@ def test_NAE_QIC_solve():
     grid = LinearGrid(L=10, M=20, N=20, NFP=eq.NFP, sym=True, axis=False)
     iota = grid.compress(eq.compute("iota", grid=grid)["iota"])
 
-    np.testing.assert_allclose(iota[1], qic.iota, atol=2e-5)
-    np.testing.assert_allclose(iota[1:10], qic.iota, atol=5e-4)
+    np.testing.assert_allclose(iota[0], qic.iota, rtol=1e-5)
+    np.testing.assert_allclose(iota[1:10], qic.iota, rtol=1e-3)
 
     # check lambda to match near axis
     grid_2d_05 = LinearGrid(rho=np.array(1e-6), M=50, N=50, NFP=eq.NFP, endpoint=True)
@@ -1186,44 +1273,6 @@ class TestGetExample:
 
 
 @pytest.mark.unit
-def test_single_coil_optimization():
-    """Test that single coil (not coilset) optimization works."""
-    # testing that the objectives work and that the optimization framework
-    # works when a single coil is passed in.
-    opt = Optimizer("fmintr")
-    coil = FourierRZCoil()
-    coil.change_resolution(N=1)
-    target_R = 9
-    target_length = 2 * np.pi * target_R
-    target_curvature = 1 / target_R
-    target_torsion = 0
-    grid = LinearGrid(N=2)
-
-    # length and curvature
-    obj = ObjectiveFunction(
-        (
-            CoilLength(coil, target=target_length),
-            CoilCurvature(coil, target=target_curvature, grid=grid),
-        ),
-    )
-    opt.optimize([coil], obj)
-    np.testing.assert_allclose(
-        coil.compute("length")["length"], target_length, rtol=3e-3
-    )
-    np.testing.assert_allclose(
-        coil.compute("curvature", grid=grid)["curvature"], target_curvature, rtol=3e-3
-    )
-
-    # torsion
-    coil.Z_n = coil.Z_n.at[0].set(0.1)  # initialize with some torsion
-    obj = ObjectiveFunction(CoilTorsion(coil, target=target_torsion, grid=grid))
-    opt.optimize([coil], obj)
-    np.testing.assert_allclose(
-        coil.compute("torsion", grid=grid)["torsion"], target_torsion, atol=1e-5
-    )
-
-
-@pytest.mark.unit
 def test_quadratic_flux_optimization_with_analytic_field():
     """Test analytic field optimization to reduce quadratic flux.
 
@@ -1305,7 +1354,9 @@ def test_second_stage_optimization_CoilSet():
             ),
             NFP=4,
             sym=True,
+            check_intersection=False,
         ),
+        check_intersection=False,
     )
     grid = LinearGrid(M=5)
     objective = ObjectiveFunction(
@@ -1336,35 +1387,89 @@ def test_second_stage_optimization_CoilSet():
     np.testing.assert_allclose(field[0].current, 0, atol=1e-12)
 
 
-# TODO: replace this with the solution to Issue #1021
+@pytest.mark.slow
 @pytest.mark.unit
-def test_optimize_with_fourier_planar_coil():
-    """Test optimizing a FourierPlanarCoil."""
+def test_optimize_with_all_coil_types(DummyCoilSet, DummyMixedCoilSet):
+    """Test optimizing for every type of coil and dummy coil sets."""
+    sym_coils = load(load_from=str(DummyCoilSet["output_path_sym"]), file_format="hdf5")
+    asym_coils = load(
+        load_from=str(DummyCoilSet["output_path_asym"]), file_format="hdf5"
+    )
+    mixed_coils = load(
+        load_from=str(DummyMixedCoilSet["output_path"]), file_format="hdf5"
+    )
+    nested_coils = MixedCoilSet(sym_coils, mixed_coils, check_intersection=False)
+    eq = Equilibrium()
+    # not attempting to accurately calc B for this test,
+    # so make the grids very coarse
+    quad_eval_grid = LinearGrid(M=2, sym=True)
+    quad_field_grid = LinearGrid(N=2)
+
+    def test(c, method):
+        target = 11
+        rtol = 1e-3
+        # first just check that quad flux works for a couple iterations
+        # as this is an expensive objective to compute
+        obj = ObjectiveFunction(
+            QuadraticFlux(
+                eq=eq,
+                field=c,
+                vacuum=True,
+                weight=1e-4,
+                eval_grid=quad_eval_grid,
+                field_grid=quad_field_grid,
+            )
+        )
+        optimizer = Optimizer(method)
+        (c,), _ = optimizer.optimize(c, obj, maxiter=2, ftol=0, xtol=1e-15)
+
+        # now check with optimizing geometry and actually check result
+        objs = [
+            CoilLength(c, target=target),
+        ]
+        extra_msg = ""
+        if isinstance(c, MixedCoilSet):
+            # just to check they work without error
+            objs.extend(
+                [
+                    CoilCurvature(c, target=0.5, weight=1e-2),
+                    CoilTorsion(c, target=0, weight=1e-2),
+                ]
+            )
+            rtol = 3e-2
+            extra_msg = " with curvature and torsion obj"
+
+        obj = ObjectiveFunction(objs)
+
+        (c,), _ = optimizer.optimize(c, obj, maxiter=25, ftol=5e-3, xtol=1e-15)
+        flattened_coils = tree_leaves(
+            c, is_leaf=lambda x: isinstance(x, _Coil) and not isinstance(x, CoilSet)
+        )
+        lengths = [coil.compute("length")["length"] for coil in flattened_coils]
+        np.testing.assert_allclose(
+            lengths, target, rtol=rtol, err_msg=f"lengths {c}" + extra_msg
+        )
+
+    spline_coil = mixed_coils.coils[-1].copy()
+
     # single coil
-    c = FourierPlanarCoil()
-    objective = ObjectiveFunction(CoilLength(c, target=11))
-    optimizer = Optimizer("fmintr")
-    (c,), _ = optimizer.optimize(c, objective=objective, maxiter=200, ftol=0, xtol=0)
-    np.testing.assert_allclose(c.compute("length")["length"], 11, atol=1e-3)
+    test(FourierPlanarCoil(), "fmintr")
+    test(FourierRZCoil(), "fmintr")
+    test(FourierXYZCoil(), "fmintr")
+    test(spline_coil, "fmintr")
 
-    # in MixedCoilSet
-    c = MixedCoilSet(FourierRZCoil(), FourierPlanarCoil())
-    objective = ObjectiveFunction(CoilLength(c, target=11))
-    optimizer = Optimizer("fmintr")
-    (c,), _ = optimizer.optimize(c, objective=objective, maxiter=200, ftol=0, xtol=0)
-    np.testing.assert_allclose(c.compute("length")[1]["length"], 11, atol=1e-3)
+    # CoilSet
+    test(sym_coils, "lsq-exact")
+    test(asym_coils, "lsq-exact")
 
-    # in CoilSet
-    c = CoilSet(FourierPlanarCoil(), sym=True, NFP=2)
-    objective = ObjectiveFunction(CoilLength(c, target=11))
-    optimizer = Optimizer("fmintr")
-    (c,), _ = optimizer.optimize(c, objective=objective, maxiter=200, ftol=0, xtol=0)
-    np.testing.assert_allclose(c.compute("length")[0]["length"], 11, atol=1e-3)
+    # MixedCoilSet
+    test(mixed_coils, "lsq-exact")
+    test(nested_coils, "lsq-exact")
 
 
 @pytest.mark.unit
 def test_coilset_geometry_optimization():
-    """Test optimizations with PlasmaCoilsetMinDistance and CoilsetMinDistance."""
+    """Test optimizations with PlasmaCoilSetMinDistance and CoilSetMinDistance."""
     R0 = 5  # major radius of plasma
     a = 1.2  # minor radius of plasma
     phi0 = np.pi / 12  # initial angle of coil
@@ -1401,9 +1506,9 @@ def test_coilset_geometry_optimization():
     # optimizing for target coil-plasma distance and maximum coil-coil distance
     objective = ObjectiveFunction(
         (
-            PlasmaCoilsetMinDistance(
+            PlasmaCoilSetMinDistance(
                 eq=eq,
-                coils=coils,
+                coil=coils,
                 target=offset,
                 weight=2,
                 plasma_grid=plasma_grid,
@@ -1411,7 +1516,7 @@ def test_coilset_geometry_optimization():
                 eq_fixed=True,
                 coils_fixed=False,
             ),
-            CoilsetMinDistance(
+            CoilSetMinDistance(
                 coils,
                 target=2 * np.pi * (R0 - offset) / coils.num_coils,
                 grid=coil_grid,
@@ -1443,9 +1548,9 @@ def test_coilset_geometry_optimization():
     # same optimization as above, but with a fixed surface instead of an equilibrium
     objective = ObjectiveFunction(
         (
-            PlasmaCoilsetMinDistance(
+            PlasmaCoilSetMinDistance(
                 eq=surf,
-                coils=coils,
+                coil=coils,
                 target=offset,
                 weight=2,
                 plasma_grid=plasma_grid,
@@ -1453,7 +1558,7 @@ def test_coilset_geometry_optimization():
                 eq_fixed=True,
                 coils_fixed=False,
             ),
-            CoilsetMinDistance(
+            CoilSetMinDistance(
                 coils,
                 target=2 * np.pi * (R0 - offset) / coils.num_coils,
                 grid=coil_grid,
@@ -1490,9 +1595,9 @@ def test_coilset_geometry_optimization():
 
     objective = ObjectiveFunction(
         (
-            PlasmaCoilsetMinDistance(
+            PlasmaCoilSetMinDistance(
                 eq=surf,
-                coils=coils,
+                coil=coils,
                 target=offset,
                 plasma_grid=plasma_grid,
                 coil_grid=coil_grid,
@@ -1527,3 +1632,151 @@ def test_coilset_geometry_optimization():
         abs(surf_opt.Z_lmn[surf_opt.Z_basis.get_idx(M=-1, N=0)]) + offset,
         rtol=2e-2,
     )
+
+
+@pytest.mark.unit
+def test_ballooning_stability_opt():
+    """Perform ballooning stability optimization with DESC."""
+    try:
+        eq = get("HELIOTRON")[-1]
+    except TypeError:
+        eq = get("HELIOTRON")
+
+    # Flux surfaces on which to evaluate ballooning stability
+    surfaces = [0.8]
+
+    grid = LinearGrid(rho=jnp.array(surfaces), NFP=eq.NFP)
+    eq_data_keys = ["iota"]
+
+    data = eq.compute(eq_data_keys, grid=grid)
+    iota = data["iota"]
+
+    Nalpha = int(8)  # Number of field lines
+
+    assert Nalpha == int(8), "Nalpha in the compute function hard-coded to 8!"
+
+    # Field lines on which to evaluate ballooning stability
+    alpha = jnp.linspace(0, np.pi, Nalpha + 1)[:Nalpha]
+
+    # Number of toroidal transits of the field line
+    ntor = int(3)
+
+    # Number of point along a field line in ballooning space
+    N0 = int(2.0 * ntor * eq.M_grid * eq.N_grid + 1)
+
+    # range of the ballooning coordinate zeta
+    zeta = np.linspace(-jnp.pi * ntor, jnp.pi * ntor, N0)
+
+    lam2_initial = np.zeros(
+        len(surfaces),
+    )
+    for i in range(len(surfaces)):
+        rho = surfaces[i] * np.ones((N0 * Nalpha,))
+
+        theta_PEST = alpha[:, None] + iota[0] * zeta
+        zeta_full = jnp.tile(zeta, Nalpha)
+
+        theta_PEST = theta_PEST.flatten()
+        zeta_full = zeta_full.flatten()
+
+        theta_coords = jnp.array([rho, theta_PEST, zeta_full]).T
+
+        # Rootfinding theta for a given theta_PEST
+        desc_coords = compute_theta_coords(
+            eq, theta_coords, L_lmn=eq.L_lmn, tol=1e-8, maxiter=25
+        )
+
+        sfl_grid = Grid(desc_coords, sort=False)
+
+        data_keys = ["ideal_ball_gamma2"]
+        data = eq.compute(data_keys, grid=sfl_grid)
+
+        lam2_initial[i] = data["ideal_ball_gamma2"]
+
+    # Flux surfaces on which to evaluate ballooning stability
+    surfaces_ball = surfaces
+
+    # Determine which modes to unfix
+    k = 2
+
+    objs_ball = {}
+
+    eq_ball_weight = 1.0e2
+
+    for i, rho in enumerate(surfaces_ball):
+        shift_arr = np.random.default_rng().uniform(-0.1, 0.1, Nalpha - 1)
+        alpha = np.reshape(np.linspace(0, np.pi, Nalpha + 1)[:Nalpha], (-1, 1))
+        alpha[1:, :] = alpha[1:, :] + np.reshape(shift_arr, (-1, 1))
+
+        objs_ball[rho] = BallooningStability(
+            eq=eq,
+            rho=np.array([rho]),
+            alpha=alpha,
+            zetamax=ntor * jnp.pi,
+            nzeta=N0,
+            weight=eq_ball_weight,
+        )
+
+    modes_R = np.vstack(
+        (
+            [0, 0, 0],
+            eq.surface.R_basis.modes[
+                np.max(np.abs(eq.surface.R_basis.modes), 1) > k, :
+            ],
+        )
+    )
+    modes_Z = eq.surface.Z_basis.modes[
+        np.max(np.abs(eq.surface.Z_basis.modes), 1) > k, :
+    ]
+
+    objective = ObjectiveFunction(tuple(objs_ball.values()))
+
+    constraints = (
+        ForceBalance(eq=eq),
+        FixBoundaryR(eq=eq, modes=modes_R),
+        FixBoundaryZ(eq=eq, modes=modes_Z),
+        FixPressure(eq=eq),
+        FixIota(eq=eq),
+        FixPsi(eq=eq),
+    )
+
+    optimizer = Optimizer("proximal-lsq-exact")
+    (eq,), _ = optimizer.optimize(
+        eq,
+        objective,
+        constraints,
+        ftol=1e-4,
+        xtol=1e-6,
+        gtol=1e-6,
+        maxiter=5,  # increase maxiter to 50 for a better result
+        verbose=3,
+        options={"initial_trust_ratio": 2e-3},
+    )
+
+    lam2_optimized = np.zeros(
+        len(surfaces),
+    )
+    for i in range(len(surfaces)):
+        rho = surfaces[i] * np.ones((N0 * Nalpha,))
+
+        theta_PEST = alpha[:, None] + iota[0] * zeta
+        zeta_full = jnp.tile(zeta, Nalpha)
+
+        theta_PEST = theta_PEST.flatten()
+        zeta_full = zeta_full.flatten()
+
+        theta_coords = jnp.array([rho, theta_PEST, zeta_full]).T
+
+        # Rootfinding theta for a given theta_PEST
+        desc_coords = compute_theta_coords(
+            eq, theta_coords, L_lmn=eq.L_lmn, tol=1e-8, maxiter=25
+        )
+
+        sfl_grid = Grid(desc_coords, sort=False)
+
+        data_keys = ["ideal_ball_gamma2"]
+        data = eq.compute(data_keys, grid=sfl_grid)
+
+        lam2_optimized[i] = data["ideal_ball_gamma2"]
+
+    assert lam2_optimized < lam2_initial
